@@ -1,28 +1,33 @@
-
 #!/usr/bin/env python3
 
 import asyncio
-
 import json
 import logging
 import os
-import pprint
 import ssl
 import certifi
 from typing import Any, Dict, List, Optional, Union
 from urllib.parse import urljoin
-import aiohttp
-from mcp.server.models import InitializationOptions
-import mcp.types as types
-from mcp.server import NotificationOptions, Server
-import mcp.server.stdio
-from dotenv import load_dotenv
 
+import aiohttp
+import uvicorn
+from starlette.applications import Starlette
+from starlette.requests import Request
+from starlette.routing import Route, Mount
+
+# Import FastMCP and SseServerTransport
+from mcp.server.fastmcp import FastMCP
+from mcp.shared.exceptions import McpError
+from mcp.types import ErrorData, INTERNAL_ERROR, INVALID_PARAMS
+from mcp.server.sse import SseServerTransport
+
+from dotenv import load_dotenv
 
 load_dotenv()
 os.environ["REQUESTS_CA_BUNDLE"] = certifi.where()
+
 # Configure logging
-logging.basicConfig(level=logging.INFO,filename="mcp-ckan-server.log")
+logging.basicConfig(level=logging.INFO, filename="mcp-ckan-server.log", format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("mcp-ckan-server")
 
 class CKANAPIClient:
@@ -36,11 +41,13 @@ class CKANAPIClient:
     async def __aenter__(self):
         ssl_context = ssl.create_default_context(cafile=certifi.where())
         self.session = aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=ssl_context))
+        logger.info(f"CKANAPIClient session opened for base_url: {self.base_url}")
         return self
     
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         if self.session:
             await self.session.close()
+            logger.info("CKANAPIClient session closed.")
     
     def _get_headers(self) -> Dict[str, str]:
         headers = {
@@ -56,288 +63,190 @@ class CKANAPIClient:
         url = urljoin(f"{self.base_url}/api/3/action/", endpoint)
         headers = self._get_headers()
         
+        logger.info(f"Making CKAN API request: {method} {url} with data: {data}")
         try:
-            
             async with self.session.request(method, url, headers=headers, json=data) as response:
                 result = await response.json()
-                logger.warn(result)
+                # logger.warn(result) # Changed to info, as 'warn' usually indicates a problem, not just data
+                logger.info(f"CKAN API response for {endpoint}: {json.dumps(result, indent=2)}")
                 if not result.get('success', False):
                     error_msg = result.get('error', {})
                     raise Exception(f"CKAN API Error: {error_msg}")
                 
                 return result.get('result', {})
         except aiohttp.ClientError as e:
+            logger.error(f"HTTP Client Error during request to {url}: {e}")
             raise Exception(f"HTTP Error: {str(e)}")
         except Exception as e:
+            logger.error(f"Unexpected error during request to {url}: {e}", exc_info=True)
             raise Exception(f"Request failed: {str(e)}")
 
-# Global CKAN client
-ckan_client = None
+# Global CKAN client - will be initialized in the lifespan context
+ckan_client: Optional[CKANAPIClient] = None
 
-# Initialize MCP server
-server = Server("ckan-mcp-server")
+# Initialize FastMCP server
+# We use FastMCP directly now, not the lower-level 'Server' class
+mcp_server = FastMCP("ckan-mcp-server")
 
-@server.list_tools()
-async def handle_list_tools() -> List[types.Tool]:
-    """List available CKAN API tools"""
-    return [
-        types.Tool(
-            name="ckan_package_list",
-            description="Get list of all packages (datasets) in CKAN (unsorted)",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "limit": {
-                        "type": "integer",
-                        "description": "Maximum number of packages to return",
-                        "default": 100
-                    },
-                    "offset": {
-                        "type": "integer", 
-                        "description": "Offset for pagination",
-                        "default": 0
-                    }
-                }
-            }
-        ),
-        types.Tool(
-            name="ckan_package_show",
-            description="Get details of a specific package/dataset (like dates)",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "id": {
-                        "type": "string",
-                        "description": "Package ID or name"
-                    }
-                },
-                "required": ["id"]
-            }
-        ),
-        types.Tool(
-            name="ckan_package_search",
-            description="Search for packages using queries",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "q": {
-                        "type": "string",
-                        "description": "Search query",
-                        "default": "*:*"
-                    },
-                    "fq": {
-                        "type": "string",
-                        "description": "Filter query"
-                    },
-                    "sort": {
-                        "type": "string",
-                        "description": "Sort field and direction (e.g., 'score desc')"
-                    },
-                    "rows": {
-                        "type": "integer",
-                        "description": "Number of results to return",
-                        "default": 10
-                    },
-                    "start": {
-                        "type": "integer",
-                        "description": "Offset for pagination",
-                        "default": 0
-                    }
-                }
-            }
-        ),
-        types.Tool(
-            name="ckan_organization_list",
-            description="Get list of all organizations",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "all_fields": {
-                        "type": "boolean",
-                        "description": "Include all organization fields",
-                        "default": False
-                    }
-                }
-            }
-        ),
-        types.Tool(
-            name="ckan_organization_show",
-            description="Get details of a specific organization",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "id": {
-                        "type": "string",
-                        "description": "Organization ID or name"
-                    },
-                    "include_datasets": {
-                        "type": "boolean",
-                        "description": "Include organization's datasets",
-                        "default": False
-                    }
-                },
-                "required": ["id"]
-            }
-        ),
-        types.Tool(
-            name="ckan_group_list",
-            description="Get list of all groups",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "all_fields": {
-                        "type": "boolean",
-                        "description": "Include all group fields",
-                        "default": False
-                    }
-                }
-            }
-        ),
-        types.Tool(
-            name="ckan_tag_list",
-            description="Get list of all tags",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "vocabulary_id": {
-                        "type": "string",
-                        "description": "Vocabulary ID to filter tags"
-                    }
-                }
-            }
-        ),
-        types.Tool(
-            name="ckan_resource_show",
-            description="Get details of a specific resource",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "id": {
-                        "type": "string",
-                        "description": "Resource ID"
-                    }
-                },
-                "required": ["id"]
-            }
-        ),
-        types.Tool(
-            name="ckan_site_read",
-            description="Get site information and statistics",
-            inputSchema={
-                "type": "object",
-                "properties": {}
-            }
-        ),
-        types.Tool(
-            name="ckan_status_show",
-            description="Get CKAN site status and version information",
-            inputSchema={
-                "type": "object",
-                "properties": {}
-            }
-        )
-    ]
-
-@server.call_tool()
-async def handle_call_tool(name: str, arguments: Optional[Dict[str, Any]]) -> List[types.TextContent]:
-    """Handle tool calls to CKAN API"""
+@mcp_server.tool() # Decorator from FastMCP
+async def ckan_package_list(limit: int = 100, offset: int = 0) -> List[str]: # Type hints for schema generation
+    """Get list of all packages (datasets) in CKAN (unsorted)."""
     if not ckan_client:
-        raise Exception("CKAN client not initialized. Please set CKAN_URL environment variable.")
+        raise McpError(ErrorData(code=INTERNAL_ERROR, message="CKAN client not initialized."))
     
     try:
-        if name == "ckan_package_list":
-            limit = arguments.get("limit", 100) if arguments else 100
-            offset = arguments.get("offset", 0) if arguments else 0
-            result = await ckan_client._make_request("GET", f"package_list?limit={limit}&offset={offset}")
-            
-        elif name == "ckan_package_show":
-            package_id = arguments["id"]
-            result = await ckan_client._make_request("GET", f"package_show?id={package_id}")
-            
-        elif name == "ckan_package_search":
-            params = arguments or {}
-            query_params = []
-            for key, value in params.items():
-                if value is not None:
-                    query_params.append(f"{key}={value}")
-            query_string = "&".join(query_params)
-            result = await ckan_client._make_request("GET", f"package_search?{query_string}")
-            
-        elif name == "ckan_organization_list":
-            all_fields = arguments.get("all_fields", False) if arguments else False
-            result = await ckan_client._make_request("GET", f"organization_list?all_fields={all_fields}")
-            
-        elif name == "ckan_organization_show":
-            org_id = arguments["id"]
-            include_datasets = arguments.get("include_datasets", False)
-            result = await ckan_client._make_request("GET", f"organization_show?id={org_id}&include_datasets={include_datasets}")
-            
-        elif name == "ckan_group_list":
-            all_fields = arguments.get("all_fields", False) if arguments else False
-            result = await ckan_client._make_request("GET", f"group_list?all_fields={all_fields}")
-            
-        elif name == "ckan_tag_list":
-            params = arguments or {}
-            query_params = []
-            for key, value in params.items():
-                if value is not None:
-                    query_params.append(f"{key}={value}")
-            query_string = "&".join(query_params)
-            endpoint = f"tag_list?{query_string}" if query_string else "tag_list"
-            result = await ckan_client._make_request("GET", endpoint)
-            
-        elif name == "ckan_resource_show":
-            resource_id = arguments["id"]
-            result = await ckan_client._make_request("GET", f"resource_show?id={resource_id}")
-            
-        elif name == "ckan_site_read":
-            result = await ckan_client._make_request("GET", "site_read")
-            
-        elif name == "ckan_status_show":
-            result = await ckan_client._make_request("GET", "status_show")
-            
-        else:
-            raise Exception(f"Unknown tool: {name}")
-        
-        return [
-            types.TextContent(
-                type="text",
-                text=json.dumps(result, indent=2, ensure_ascii=False)
-            )
-        ]
-        
+        result = await ckan_client._make_request("GET", f"package_list?limit={limit}&offset={offset}")
+        return result
     except Exception as e:
-        logger.error(f"Error calling tool {name}: {str(e)}")
-        return [
-            types.TextContent(
-                type="text", 
-                text=f"Error: {str(e)}"
-            )
-        ]
+        logger.error(f"Error in ckan_package_list: {e}")
+        raise McpError(ErrorData(code=INTERNAL_ERROR, message=f"Failed to list packages: {e}"))
 
-@server.list_resources()
-async def handle_list_resources() -> List[types.Resource]:
-    """List available CKAN resources"""
-    return [
-        types.Resource(
-            uri="ckan://api/docs",
-            name="CKAN API Documentation",
-            description="Official CKAN API documentation and endpoints",
-            mimeType="text/plain"
-        ),
-        types.Resource(
-            uri="ckan://config",
-            name="CKAN Server Configuration",
-            description="Current CKAN server configuration and connection details",
-            mimeType="application/json"
-        )
-    ]
+@mcp_server.tool()
+async def ckan_package_show(id: str) -> Dict[str, Any]:
+    """Get details of a specific package/dataset (like dates)."""
+    if not ckan_client:
+        raise McpError(ErrorData(code=INTERNAL_ERROR, message="CKAN client not initialized."))
+    
+    try:
+        result = await ckan_client._make_request("GET", f"package_show?id={id}")
+        return result
+    except Exception as e:
+        logger.error(f"Error in ckan_package_show: {e}")
+        raise McpError(ErrorData(code=INTERNAL_ERROR, message=f"Failed to show package: {e}"))
 
-@server.read_resource()
-async def handle_read_resource(uri: str) -> str:
-    """Read CKAN resources"""
-    if uri == "ckan://api/docs":
-        return """
+@mcp_server.tool()
+async def ckan_package_search(
+        q: str = "*:*",
+        #fq: Optional[str] = None,
+        #sort: Optional[str] = None,
+        rows: int = 10,
+        start: int = 0
+) -> Dict[str, Any]:
+    """Search for packages using queries."""
+    if not ckan_client:
+        raise McpError(ErrorData(code=INTERNAL_ERROR, message="CKAN client not initialized."))
+    
+    try:
+        params = {"q": q, "fq": fq, "sort": sort, "rows": rows, "start": start}
+        query_params = []
+        for key, value in params.items():
+            if value is not None:
+                query_params.append(f"{key}={value}")
+        query_string = "&".join(query_params)
+        result = await ckan_client._make_request("GET", f"package_search?{query_string}")
+        return result
+    except Exception as e:
+        logger.error(f"Error in ckan_package_search: {e}")
+        raise McpError(ErrorData(code=INTERNAL_ERROR, message=f"Failed to search packages: {e}"))
+
+@mcp_server.tool()
+async def ckan_organization_list(all_fields: bool = False) -> List[Union[str, Dict[str, Any]]]:
+    """Get list of all organizations."""
+    if not ckan_client:
+        raise McpError(ErrorData(code=INTERNAL_ERROR, message="CKAN client not initialized."))
+    
+    try:
+        result = await ckan_client._make_request("GET", f"organization_list?all_fields={all_fields}")
+        return result
+    except Exception as e:
+        logger.error(f"Error in ckan_organization_list: {e}")
+        raise McpError(ErrorData(code=INTERNAL_ERROR, message=f"Failed to list organizations: {e}"))
+
+@mcp_server.tool()
+async def ckan_organization_show(id: str, include_datasets: bool = False) -> Dict[str, Any]:
+    """Get details of a specific organization."""
+    if not ckan_client:
+        raise McpError(ErrorData(code=INTERNAL_ERROR, message="CKAN client not initialized."))
+    
+    try:
+        result = await ckan_client._make_request("GET", f"organization_show?id={id}&include_datasets={include_datasets}")
+        return result
+    except Exception as e:
+        logger.error(f"Error in ckan_organization_show: {e}")
+        raise McpError(ErrorData(code=INTERNAL_ERROR, message=f"Failed to show organization: {e}"))
+
+@mcp_server.tool()
+async def ckan_group_list(all_fields: bool = False) -> List[Union[str, Dict[str, Any]]]:
+    """Get list of all groups."""
+    if not ckan_client:
+        raise McpError(ErrorData(code=INTERNAL_ERROR, message="CKAN client not initialized."))
+    
+    try:
+        result = await ckan_client._make_request("GET", f"group_list?all_fields={all_fields}")
+        return result
+    except Exception as e:
+        logger.error(f"Error in ckan_group_list: {e}")
+        raise McpError(ErrorData(code=INTERNAL_ERROR, message=f"Failed to list groups: {e}"))
+
+@mcp_server.tool()
+async def ckan_tag_list(
+        #vocabulary_id: Optional[str] = None
+) -> List[Union[str, Dict[str, Any]]]:
+    """Get list of all tags."""
+    if not ckan_client:
+        raise McpError(ErrorData(code=INTERNAL_ERROR, message="CKAN client not initialized."))
+    
+    try:
+        params = {"vocabulary_id": vocabulary_id}
+        query_params = []
+        for key, value in params.items():
+            if value is not None:
+                query_params.append(f"{key}={value}")
+        query_string = "&".join(query_params)
+        endpoint = f"tag_list?{query_string}" if query_string else "tag_list"
+        result = await ckan_client._make_request("GET", endpoint)
+        return result
+    except Exception as e:
+        logger.error(f"Error in ckan_tag_list: {e}")
+        raise McpError(ErrorData(code=INTERNAL_ERROR, message=f"Failed to list tags: {e}"))
+
+@mcp_server.tool()
+async def ckan_resource_show(id: str) -> Dict[str, Any]:
+    """Get details of a specific resource."""
+    if not ckan_client:
+        raise McpError(ErrorData(code=INTERNAL_ERROR, message="CKAN client not initialized."))
+    
+    try:
+        result = await ckan_client._make_request("GET", f"resource_show?id={id}")
+        return result
+    except Exception as e:
+        logger.error(f"Error in ckan_resource_show: {e}")
+        raise McpError(ErrorData(code=INTERNAL_ERROR, message=f"Failed to show resource: {e}"))
+
+@mcp_server.tool()
+async def ckan_site_read() -> Dict[str, Any]:
+    """Get site information and statistics."""
+    if not ckan_client:
+        raise McpError(ErrorData(code=INTERNAL_ERROR, message="CKAN client not initialized."))
+    
+    try:
+        result = await ckan_client._make_request("GET", "site_read")
+        return result
+    except Exception as e:
+        logger.error(f"Error in ckan_site_read: {e}")
+        raise McpError(ErrorData(code=INTERNAL_ERROR, message=f"Failed to read site info: {e}"))
+
+@mcp_server.tool()
+async def ckan_status_show() -> Dict[str, Any]:
+    """Get CKAN site status and version information."""
+    if not ckan_client:
+        raise McpError(ErrorData(code=INTERNAL_ERROR, message="CKAN client not initialized."))
+    
+    try:
+        result = await ckan_client._make_request("GET", "status_show")
+        return result
+    except Exception as e:
+        logger.error(f"Error in ckan_status_show: {e}")
+        raise McpError(ErrorData(code=INTERNAL_ERROR, message=f"Failed to show status: {e}"))
+
+# FastMCP automatically handles listing and calling tools defined with @mcp_server.tool()
+# So, handle_list_tools and handle_call_tool are no longer needed as separate functions
+# when using FastMCP's decorators.
+
+@mcp_server.resource(uri="ckan://api/docs")
+async def ckan_api_docs() -> str:
+    """Official CKAN API documentation and endpoints."""
+    return """
 CKAN API Documentation Summary
 
 Base URL: Configure via CKAN_URL environment variable
@@ -358,53 +267,74 @@ Key Endpoints:
 Authentication: Set CKAN_API_KEY environment variable for write operations
 
 Full documentation: https://docs.ckan.org/en/latest/api/
-        """
-    elif uri == "ckan://config":
-        config = {
-            "base_url": ckan_client.base_url if ckan_client else "Not configured",
-            "api_key_configured": bool(ckan_client and ckan_client.api_key),
-            "session_active": bool(ckan_client and ckan_client.session)
-        }
-        return json.dumps(config, indent=2)
-    else:
-        raise Exception(f"Unknown resource: {uri}")
+    """
 
-async def main():
-    """Main server function"""
-    import os
+@mcp_server.resource(uri="ckan://config")
+async def ckan_server_config() -> Dict[str, Any]:
+    """Current CKAN server configuration and connection details."""
+    config = {
+        "base_url": ckan_client.base_url if ckan_client else "Not configured",
+        "api_key_configured": bool(ckan_client and ckan_client.api_key),
+        "session_active": bool(ckan_client and ckan_client.session)
+    }
+    return config
+
+# FastMCP automatically handles listing and reading resources defined with @mcp_server.resource()
+# So, handle_list_resources and handle_read_resource are no longer needed as separate functions
+# when using FastMCP's decorators.
+
+# Setup SSE transport for FastMCP with Starlette
+sse_transport = SseServerTransport("/mcp/messages/") # Clients will POST to /mcp/messages/
+
+async def sse_endpoint(request: Request):
+    """Handles the Server-Sent Events (GET) connection for MCP communication."""
+    # FastMCP uses its internal _mcp_server to run the protocol
+    _server_instance = mcp_server._mcp_server
+    async with sse_transport.connect_sse(
+        request.scope,
+        request.receive,
+        request._send, # Internal Starlette send function, often used for direct ASGI interaction
+    ) as (reader, writer):
+        await _server_instance.run(reader, writer, _server_instance.create_initialization_options())
+
+from contextlib import asynccontextmanager
+
+@asynccontextmanager
+async def lifespan(app: Starlette):
+    """
+    Handles startup and shutdown events for the Starlette application.
+    Initializes and cleans up the CKAN API client.
+    """
+    global ckan_client
     
-    # Initialize CKAN client
     ckan_url = os.getenv("CKAN_URL")
     if not ckan_url:
         logger.error("CKAN_URL environment variable not set")
-        raise Exception("CKAN_URL environment variable is required")
+        raise Exception("CKAN_URL environment variable is required to start CKAN MCP Server")
     
     ckan_api_key = os.getenv("CKAN_API_KEY")
     
-    global ckan_client
     ckan_client = CKANAPIClient(ckan_url, ckan_api_key)
-    
-    # Start the CKAN client session
-    await ckan_client.__aenter__()
-    
-    try:
-        # Run the MCP server
-        async with mcp.server.stdio.stdio_server() as (read_stream, write_stream):
-            await server.run(
-                read_stream,
-                write_stream,
-                InitializationOptions(
-                    server_name="ckan-mcp-server",
-                    server_version="1.0.0",
-                    capabilities=server.get_capabilities(
-                        notification_options=NotificationOptions(),
-                        experimental_capabilities={},
-                    ),
-                ),
-            )
-    finally:
-        # Clean up CKAN client
-        await ckan_client.__aexit__(None, None, None)
+    await ckan_client.__aenter__() # Open the aiohttp session
+    logger.info("CKAN MCP Server application startup completed.")
+    yield # Application runs here
+    await ckan_client.__aexit__(None, None, None) # Close the aiohttp session
+    logger.info("CKAN MCP Server application shutdown completed.")
+
+app = Starlette(
+    debug=True,
+    routes=[
+        # This route handles the long-lived SSE GET connection from the client
+        Route("/mcp/sse", endpoint=sse_endpoint),
+        # This route handles the short-lived HTTP POST requests from the client
+        # It's managed by sse_transport.handle_post_message
+        Mount("/mcp/messages", app=sse_transport.handle_post_message),
+    ],
+    lifespan=lifespan # Attach the lifespan context manager
+)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    host = os.getenv("MCP_HOST", "0.0.0.0")
+    port = int(os.getenv("MCP_PORT", "8001"))
+    logger.info(f"Starting CKAN MCP Server with FastMCP and Starlette on http://{host}:{port}")
+    uvicorn.run(app, host=host, port=port)

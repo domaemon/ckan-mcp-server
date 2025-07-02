@@ -1,5 +1,0 @@
-uv
-openai-agents
-mcp>=1.0.0
-aiohttp>=3.8.0
-asyncio
