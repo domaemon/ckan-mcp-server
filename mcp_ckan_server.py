@@ -6,7 +6,8 @@ import logging
 import os
 import ssl
 import certifi
-from typing import Any, Dict, List, Optional, Union
+from typing import Annotated, Any, Dict, List, Optional, Union
+from pydantic import Field
 from urllib.parse import urljoin
 
 import aiohttp
@@ -89,7 +90,10 @@ ckan_client: Optional[CKANAPIClient] = None
 mcp_server = FastMCP("ckan-mcp-server")
 
 @mcp_server.tool() # Decorator from FastMCP
-async def ckan_package_list(limit: int = 100, offset: int = 0) -> List[str]: # Type hints for schema generation
+async def ckan_package_list(
+        limit: Annotated[int, Field(description="Maximum number of packages to return")] = 100,
+        offset: Annotated[int, Field(description="Offset for pagination")] = 0
+) -> List[str]: # Type hints for schema generation
     """Get list of all packages (datasets) in CKAN (unsorted)."""
     if not ckan_client:
         raise McpError(ErrorData(code=INTERNAL_ERROR, message="CKAN client not initialized."))
@@ -102,7 +106,9 @@ async def ckan_package_list(limit: int = 100, offset: int = 0) -> List[str]: # T
         raise McpError(ErrorData(code=INTERNAL_ERROR, message=f"Failed to list packages: {e}"))
 
 @mcp_server.tool()
-async def ckan_package_show(id: str) -> Dict[str, Any]:
+async def ckan_package_show(
+        id: Annotated[str, Field(description="Package ID or name")]
+) -> Dict[str, Any]:
     """Get details of a specific package/dataset (like dates)."""
     if not ckan_client:
         raise McpError(ErrorData(code=INTERNAL_ERROR, message="CKAN client not initialized."))
@@ -116,11 +122,11 @@ async def ckan_package_show(id: str) -> Dict[str, Any]:
 
 @mcp_server.tool()
 async def ckan_package_search(
-        q: str = "*:*",
-        #fq: Optional[str] = None,
-        #sort: Optional[str] = None,
-        rows: int = 10,
-        start: int = 0
+        q: Annotated[str, Field(description="Search query")] = "*:*",
+        fq: Annotated[str, Field(description="Fliter query")] = None,
+        sort: Annotated[str, Field(description="Sort field and direction (e.g., 'score desc')")] = None,
+        rows: Annotated[int, Field(description="Number of results to return")] = 10,
+        start: Annotated[int, Field(description="Offset for pagination")] = 0
 ) -> Dict[str, Any]:
     """Search for packages using queries."""
     if not ckan_client:
@@ -140,7 +146,9 @@ async def ckan_package_search(
         raise McpError(ErrorData(code=INTERNAL_ERROR, message=f"Failed to search packages: {e}"))
 
 @mcp_server.tool()
-async def ckan_organization_list(all_fields: bool = False) -> List[Union[str, Dict[str, Any]]]:
+async def ckan_organization_list(
+        all_fields: Annotated[bool, Field(description="Get list of all organizations")] = False
+) -> List[Union[str, Dict[str, Any]]]:
     """Get list of all organizations."""
     if not ckan_client:
         raise McpError(ErrorData(code=INTERNAL_ERROR, message="CKAN client not initialized."))
@@ -153,7 +161,10 @@ async def ckan_organization_list(all_fields: bool = False) -> List[Union[str, Di
         raise McpError(ErrorData(code=INTERNAL_ERROR, message=f"Failed to list organizations: {e}"))
 
 @mcp_server.tool()
-async def ckan_organization_show(id: str, include_datasets: bool = False) -> Dict[str, Any]:
+async def ckan_organization_show(
+        id: Annotated[str, Field(description="Organization ID or name")],
+        include_datasets: Annotated[bool, Field(description="Include organization's datasets")] = False,
+) -> Dict[str, Any]:
     """Get details of a specific organization."""
     if not ckan_client:
         raise McpError(ErrorData(code=INTERNAL_ERROR, message="CKAN client not initialized."))
@@ -166,7 +177,9 @@ async def ckan_organization_show(id: str, include_datasets: bool = False) -> Dic
         raise McpError(ErrorData(code=INTERNAL_ERROR, message=f"Failed to show organization: {e}"))
 
 @mcp_server.tool()
-async def ckan_group_list(all_fields: bool = False) -> List[Union[str, Dict[str, Any]]]:
+async def ckan_group_list(
+        all_fields: Annotated[bool, Field(description="Include all group fields")] = False
+) -> List[Union[str, Dict[str, Any]]]:
     """Get list of all groups."""
     if not ckan_client:
         raise McpError(ErrorData(code=INTERNAL_ERROR, message="CKAN client not initialized."))
@@ -180,7 +193,7 @@ async def ckan_group_list(all_fields: bool = False) -> List[Union[str, Dict[str,
 
 @mcp_server.tool()
 async def ckan_tag_list(
-        #vocabulary_id: Optional[str] = None
+        vocabulary_id: Annotated[str, Field(description="Vocabulary ID to filter tags")] = None
 ) -> List[Union[str, Dict[str, Any]]]:
     """Get list of all tags."""
     if not ckan_client:
@@ -201,7 +214,9 @@ async def ckan_tag_list(
         raise McpError(ErrorData(code=INTERNAL_ERROR, message=f"Failed to list tags: {e}"))
 
 @mcp_server.tool()
-async def ckan_resource_show(id: str) -> Dict[str, Any]:
+async def ckan_resource_show(
+        id: Annotated[str, Field(description="Get details of a specific resource")]
+) -> Dict[str, Any]:
     """Get details of a specific resource."""
     if not ckan_client:
         raise McpError(ErrorData(code=INTERNAL_ERROR, message="CKAN client not initialized."))
